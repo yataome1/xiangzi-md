@@ -80,7 +80,60 @@
 
 ---
 
-## 五、合入 2.1.13 时的注意事项
+## 五、第二轮（2026-11-05 下午，装包验证后）
+
+用户在 2.0.58 安装包上验证，报了两个残留问题。
+
+### 5.1 Mermaid 报「图表语法有误」
+
+现象：图整体变成红字错误 `Unsupported color format: "color(srgb 0.978431 0.984314 0.992157)"`，图不渲染。
+
+原因：`mermaidThemeVariables` 把 CSS 变量原样交给 mermaid，而 mermaid 内部的 khroma
+只认 `#rrggbb` / `rgb()`。当前主题用 `color-mix()` 表达配色，Chromium 在读取自定义
+属性时把混合结果序列化成 `color(srgb 0.97 0.98 0.99)`（实测 canvas 对 `color-mix`
+求值后也返回这个形式，对 `oklch` 则原样返回）。
+
+修复：新增 `src/lib/mermaidColor.ts`，把每个变量归一化成 `#rrggbb`：
+
+| 输入 | 处理 |
+| --- | --- |
+| `#rrggbb` / `#rgb` / `#rrggbbaa` | 直接规整，丢弃 alpha |
+| `rgb()` / `rgba()` / 空格分隔 | 解析通道并 clamp |
+| `color(srgb …)` / `color(display-p3 …)` | 0–1 分量 ×255 |
+| `oklch(L C H)` | 走 OKLab → LMS → linear sRGB → gamma（canvas 不帮忙） |
+| 命名色、`hsl()` 等 | canvas 探针 |
+| 解析失败 | 回退默认色，**不再让整张图报错** |
+
+实测：`color-mix(in srgb, #ffffff 96%, #e8eef7)` → `#fefeff`；
+`oklch(0.62 0.19 264)` → `#497ef7`；`rebeccapurple` → `#663399`；非法值 → 默认色。
+单测 8 条覆盖以上分支。
+
+### 5.2 松开滚动条后往上回弹
+
+现象：拖到下方松手，拇指往上跳一截（用户描述「并没有停在拖动的位置」）。
+
+实测（拖 260 / 420 / 520px）：松手后拇指分别回退 **40 / 71 / 57px**，`scrollTop` 不变。
+
+原因：拖动时用「起点滚动位置 + 指针总位移」换算，分母是**按下瞬间**的 `scrollHeight`。
+拖动过程中 CodeMirror 测量视口外的块，文档变高，同样的指针位移换算出的滚动量偏小；
+拇指按指针 1:1 绘制，松手时改用真实 `scrollTop` 重算，两者不一致 → 回退。
+
+修复（`HoverScrollbars.tsx`）：
+
+1. **增量滚动**：每次 pointermove 只换算「本次指针增量」，叠加到当前实际位置，分母用实时滚动范围。跟手度从偏 15% 收敛到 2–5%。
+2. **拇指跟真实位置**：新增 `trackActualPosition`，拖动期间每帧按浏览器实际 `scrollTop / 实时 max` 计算拇指位置（写完 `scrollTop` 后 CodeMirror 还会做一次 scroll anchoring，同步读到的不是最终值）。
+3. 松手不再有额外重算差异，实测三个距离回弹均为 **0px**。
+
+回归：`e2e/scrollbar-click-stability.spec.ts` 的拖动用例改为断言「滚动单调 + 松手后拇指与 scrollTop 与松手前一致（≤2px）」。
+
+### 5.3 本轮门禁
+
+`npm run check` 全绿：135 个测试文件 / 1209 个用例、lint 零 warning、bundle 212.3 KiB；
+`npm run test:e2e --project=chromium` 32 个通过（含长图导出、拖动稳定性）。
+
+---
+
+## 六、合入 2.1.13 时的注意事项
 
 改动按"单函数/单条样式"组织，冲突面小：
 
@@ -92,4 +145,8 @@
 
 1. SVG 渲染完成后，用 `getBBox()` 加 12px 重写 viewBox，并让根元素 `overflow: visible`。
 2. 表格 `estimatedHeight` 从固定行高改为「内容折行估算 + 按（源码, 宽度, 布局）缓存实测高度」，缓冲从 2k 提到 30k。
-3. 滚动条拖动全程使用按下瞬间的快照参数；滚动期间只更新位置，不更新尺寸；去掉 `attributes` 观察。
+3. 交给 mermaid 前，把所有 CSS 颜色变量归一化成 `#rrggbb`，解析不出来就用默认色，不要让 khroma 抛错。
+4. 滚动条拖动改为**增量**换算（每步只换算本次指针位移，分母用实时滚动范围），拇指每帧跟真实 `scrollTop`，松手不再回弹。
+5. 滚动期间冻结拇指尺寸（200ms 后收敛），去掉 `attributes` 观察。
+
+第二轮的改动集中在两个新文件（`src/lib/mermaidColor.ts` 及其测试）和 `HoverScrollbars.tsx` 的拖动函数，2.1.13 若重写过这两处，按行为描述重做成本也不高。
