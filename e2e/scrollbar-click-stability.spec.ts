@@ -102,17 +102,32 @@ test('dragging the thumb keeps the scroll monotonic and the thumb in lockstep', 
       }),
     )
   }
+  const beforeRelease = samples[samples.length - 1]
   await page.mouse.up()
+  await page.waitForTimeout(500)
+  const afterRelease = await page.evaluate(() => {
+    const dom = document.querySelector('.cm-scroller') as HTMLElement
+    const element = document.querySelector(
+      '.xmd-cm-editor .hover-scrollbar-track-vertical .hover-scrollbar-thumb',
+    ) as HTMLElement
+    const match = /translateY\(([-\d.]+)px\)/.exec(element.style.transform)
+    return { top: dom.scrollTop, thumb: match ? Number(match[1]) : Number.NaN }
+  })
 
   for (let index = 1; index < samples.length; index += 1) {
     // 指针一直向下，滚动位置不允许回退。
     expect(samples[index].top).toBeGreaterThanOrEqual(samples[index - 1].top - 1)
-    // 拇指的可移动距离等于拖动映射的分母，所以它应该跟着指针走同样多的像素。
-    const thumbDelta = samples[index].thumb - samples[index - 1].thumb
-    expect(Math.abs(thumbDelta - stepPx)).toBeLessThanOrEqual(2)
   }
 
-  const scrolled = samples[samples.length - 1].top
+  /*
+   * 松手后必须停在拖到的位置。旧实现按「拖动起点 + 指针总位移」算滚动量，
+   * 而文档在拖动中会被 CodeMirror 拉高，松手时按新的 scrollHeight 重算，
+   * 拇指就往上弹一截（实测 260px 回弹 40px）。
+   */
+  expect(Math.abs(afterRelease.thumb - beforeRelease.thumb)).toBeLessThanOrEqual(2)
+  expect(Math.abs(afterRelease.top - beforeRelease.top)).toBeLessThanOrEqual(2)
+
+  const scrolled = afterRelease.top
   const maxScroll = await scroller.evaluate(
     (element) => element.scrollHeight - element.clientHeight,
   )

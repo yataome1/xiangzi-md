@@ -34,6 +34,9 @@ interface DragState {
   maxThumbOffset: number
   /** 拇指在轨道内的可移动距离，与 maxThumbOffset 同值，单独留着便于阅读。 */
   travel: number
+  /** 上一次 pointermove 的指针坐标与滚动位置：按增量滚动，跟手度不受文档高度变化拖累。 */
+  lastPointerPosition: number
+  lastScroll: number
 }
 
 function readMetrics(element: HTMLElement): Metrics {
@@ -144,6 +147,41 @@ export default function HoverScrollbars({
     onInteractionEndRef.current?.()
   }, [targetRef])
 
+  /**
+   * 拖动期间每帧把拇指对齐到「浏览器实际接受的位置」。
+   *
+   * 两个原因：
+   * 1. 写完 scrollTop 之后 CodeMirror 还会按高度图做一次 scroll anchoring，
+   *    同步读回的不是最终值；
+   * 2. 文档高度在拖动中会变（视口外块被测量），松手时如果按另一套比例重算，
+   *    拇指就会往回弹一截（实测拖 260px 回弹 40px）。
+   *
+   * 这里用**实时**的 scrollHeight/clientHeight 求比例，与松手后的计算口径一致，
+   * 所以松手不再跳；代价是拖动过程中拇指可能因高度变化微调几像素。
+   *
+   * 必须放在所有提前 return 之前：组件在 `metrics` 为空时会直接返回 null，
+   * 把 hook 放到后面会让两次渲染的 hook 数量不一致。
+   */
+  const trackActualPosition = useCallback(
+    (axis: ScrollAxis): void => {
+      const tick = (): void => {
+        const drag = dragRef.current
+        const target = targetRef.current
+        if (!drag || drag.axis !== axis || !target) return
+        const actual = axis === 'horizontal' ? target.scrollLeft : target.scrollTop
+        const max =
+          axis === 'horizontal'
+            ? Math.max(1, target.scrollWidth - target.clientWidth)
+            : Math.max(1, target.scrollHeight - target.clientHeight)
+        const ratio = Math.min(1, Math.max(0, actual / max))
+        setDragOffset({ axis, offset: ratio * drag.travel })
+        requestAnimationFrame(tick)
+      }
+      requestAnimationFrame(tick)
+    },
+    [targetRef],
+  )
+
   useEffect(() => {
     window.addEventListener('pointerup', finishDrag)
     window.addEventListener('pointercancel', finishDrag)
@@ -201,8 +239,9 @@ export default function HoverScrollbars({
     if (!target || !track) return
     onInteractionStartRef.current?.()
 
-    // Freeze the whole scroll→thumb mapping for the duration of the drag. See
-    // `DragState.maxScroll` for why re-reading scrollHeight per move is the bug.
+    // Freeze the track geometry for the drag. `maxScroll` is only used for the
+    // initial thumb placement; the motion itself is incremental (see
+    // `handleThumbPointerMove`), because the document can grow while dragging.
     const trackRect = track.getBoundingClientRect()
     const trackLength = axis === 'horizontal' ? trackRect.width : trackRect.height
     const viewportLength = axis === 'horizontal' ? target.clientWidth : target.clientHeight
@@ -219,10 +258,13 @@ export default function HoverScrollbars({
       maxScroll,
       maxThumbOffset,
       travel: maxThumbOffset,
+      lastPointerPosition: pointerPosition(axis, event),
+      lastScroll: scrollPosition,
     }
     const ratio = maxScroll > 0 ? scrollPosition / maxScroll : 0
     setDragOffset({ axis, offset: Math.max(0, Math.min(maxThumbOffset, ratio * maxThumbOffset)) })
     event.currentTarget.setPointerCapture(event.pointerId)
+    trackActualPosition(axis)
   }
 
   const handleThumbPointerMove = (axis: ScrollAxis, event: PointerEvent<HTMLDivElement>): void => {
@@ -230,19 +272,25 @@ export default function HoverScrollbars({
     const target = targetRef.current
     if (!drag || drag.axis !== axis || !target) return
 
-    const delta = pointerPosition(axis, event) - drag.pointerPosition
+    // 按增量滚动：每步只把「这次指针移动了多少」换算成内容位移，再叠到当前
+    // 实际位置上。整段拖动共用一个起点位移的话，拖动途中文档一旦变高（视口外
+    // 块被测量），同一个指针总位移换算出的滚动量就会偏小，表现为「拖了不走」。
+    const pointer = pointerPosition(axis, event)
+    const step = pointer - drag.lastPointerPosition
+    drag.lastPointerPosition = pointer
+    if (step === 0) return
+
+    const liveMax =
+      axis === 'horizontal'
+        ? Math.max(0, target.scrollWidth - target.clientWidth)
+        : Math.max(0, target.scrollHeight - target.clientHeight)
     const nextScroll = Math.max(
       0,
-      Math.min(
-        drag.maxScroll,
-        drag.scrollPosition + (delta / drag.maxThumbOffset) * drag.maxScroll,
-      ),
+      Math.min(liveMax, drag.lastScroll + (step / drag.maxThumbOffset) * liveMax),
     )
     if (axis === 'horizontal') target.scrollLeft = nextScroll
     else target.scrollTop = nextScroll
-
-    const ratio = drag.maxScroll > 0 ? nextScroll / drag.maxScroll : 0
-    setDragOffset({ axis, offset: Math.max(0, Math.min(drag.travel, ratio * drag.travel)) })
+    drag.lastScroll = axis === 'horizontal' ? target.scrollLeft : target.scrollTop
   }
 
   const horizontalTrackLength = Math.max(0, metrics.clientWidth - (hasVertical ? 14 : 4))
