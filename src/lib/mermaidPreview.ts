@@ -1,4 +1,5 @@
 import type mermaid from 'mermaid'
+import { toMermaidColor } from './mermaidColor'
 
 // 动态加载 mermaid（体积较大）：只有真正渲染图表时才加载，避免拖慢启动
 type MermaidApi = typeof mermaid
@@ -64,7 +65,10 @@ const renderScheduler = new MermaidRenderScheduler()
 
 function readCssVar(name: string, fallback: string): string {
   const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
-  return value || fallback
+  // 主题可能用 color-mix / oklch / display-p3。浏览器把 color-mix 求值后可能序列化成
+  // `color(srgb 0.97 0.98 0.99)`，mermaid 的 khroma 解析不了，会直接让整张图变成
+  // 「图表语法有误」。统一归一化成 #rrggbb 再交给它。
+  return toMermaidColor(value, fallback)
 }
 
 /**
