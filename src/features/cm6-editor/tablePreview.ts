@@ -65,8 +65,100 @@ export interface MarkdownTablePreviewOptions {
   autoResize?: boolean
 }
 
-const DEFAULT_BUFFER_CHARS = 2_000
+/*
+ * How far beyond the visible range (in document characters) a table is still
+ * replaced by its widget.
+ *
+ * This is not a rendering budget — CM6 only calls `toDOM` for what its own
+ * viewport covers. It decides the *height model*: a decorated table reports
+ * `estimatedHeight`, an undecorated one is measured as its raw source lines.
+ * A 5-row table is ~38px of source and ~320px rendered, so with the old 2,000
+ * character band the swap happened right at the edge of the viewport and shoved
+ * the page every time a table crossed it. Mermaid hit the same problem and uses
+ * the same fix (`DEFAULT_VIEWPORT_MARGIN` in `mermaidPreview.ts`): push the
+ * boundary far outside the viewport so a block's contribution to the height map
+ * stays stable while it is anywhere near the screen.
+ *
+ * Scanning is a filtered syntax-tree walk (only `Table` nodes are parsed), so
+ * covering the whole document costs little.
+ */
+const DEFAULT_BUFFER_CHARS = 30_000
 const DEFAULT_ROW_HEIGHT = 38
+
+/*
+ * Height model for tables.
+ *
+ * CodeMirror lays out everything outside the render viewport from
+ * `WidgetType.estimatedHeight`. A table is the one block whose real height is
+ * wildly content-dependent: a single-line row measures ~42px, a row whose cells
+ * wrap twice measures ~70px, three lines ~98px. Multiplying the row count by a
+ * flat 38 underestimates a long-text table by 100–150px each, and this document
+ * has 35 of them — roughly 7,000px of accumulated error. Every time a table
+ * enters the viewport CM6 replaces the estimate with the measured height, so
+ * `scrollHeight` keeps changing while the user scrolls, which is what made the
+ * scrollbar thumb jump.
+ *
+ * Two mitigations: estimate from real cell content (below), and remember the
+ * first measured height per table so the second visit is exact.
+ */
+const TABLE_ROW_PADDING_Y = 14 // 2 × 0.45rem vertical cell padding
+const TABLE_LINE_HEIGHT = 28 // 16px body × 1.75 line-height
+const FALLBACK_CHAR_WIDTH = 14 // mixed CJK/latin average at the default font size
+const MIN_CHARS_PER_LINE = 4
+const TABLE_HEIGHT_CACHE_LIMIT = 300
+const measuredTableHeights = new Map<string, number>()
+
+function lineCount(text: string, charsPerLine: number): number {
+  if (text.length === 0) return 1
+  return Math.ceil(text.length / charsPerLine)
+}
+
+/**
+ * Estimate a rendered table's height from its text and the column width it will
+ * get. Exported for tests; the numbers above are calibrated against the real
+ * rendered rows (42 / 70 / 98 for one / two / three lines).
+ */
+export function estimateTableHeight(
+  table: Pick<MarkdownTableMatch, 'header' | 'rows'>,
+  availableWidth: number,
+  baseRowHeight: number,
+): number {
+  const columns = Math.max(1, table.header.length)
+  const usableWidth = availableWidth > 0 ? availableWidth : columns * 160
+  const cellWidth = Math.max(48, usableWidth / columns)
+  const charsPerLine = Math.max(MIN_CHARS_PER_LINE, Math.floor(cellWidth / FALLBACK_CHAR_WIDTH))
+  const rowHeight = (cells: readonly { text: string }[]): number => {
+    const lines = Math.max(1, ...cells.map((cell) => lineCount(cell.text, charsPerLine)))
+    return Math.max(baseRowHeight, TABLE_ROW_PADDING_Y + lines * TABLE_LINE_HEIGHT)
+  }
+  let total = rowHeight(table.header)
+  for (const row of table.rows) total += rowHeight(row)
+  return total + 2
+}
+
+function tableHeightKey(
+  table: Pick<MarkdownTableMatch, 'source'>,
+  availableWidth: number,
+  layoutMode: TableColumnWidthMode,
+): string {
+  // Quantise the width: the content box shifts by a pixel or two as scrollbars and
+  // panels come and go, and an exact key would miss the cache on every remount —
+  // which is exactly the case the cache exists for.
+  const widthBucket = Math.round(availableWidth / 32)
+  return `${layoutMode}\u0000${widthBucket}\u0000${table.source}`
+}
+
+function rememberTableHeight(key: string, height: number): void {
+  if (!Number.isFinite(height) || height <= 0) return
+  measuredTableHeights.delete(key)
+  measuredTableHeights.set(key, height)
+  while (measuredTableHeights.size > TABLE_HEIGHT_CACHE_LIMIT) {
+    const oldest = measuredTableHeights.keys().next().value
+    if (oldest === undefined) break
+    measuredTableHeights.delete(oldest)
+  }
+}
+
 const tableCellParser = markdownParser.configure([GFM])
 
 interface TableLayoutOverride {
@@ -1591,14 +1683,19 @@ function settleCellContextMenuSelection(cell: HTMLElement, event: MouseEvent): v
 }
 
 class TableWidget extends WidgetType {
+  private readonly heightKey: string
+
   constructor(
     readonly table: MarkdownTableMatch,
     readonly rowHeight: number,
     readonly readOnly: boolean,
     readonly layoutMode: TableColumnWidthMode,
     readonly autoResize: boolean,
+    /** 表格实际可用的内容宽度：折行数与它直接相关，估算和缓存 key 都要用。 */
+    readonly availableWidth: number,
   ) {
     super()
+    this.heightKey = tableHeightKey(table, availableWidth, layoutMode)
   }
   eq(other: TableWidget): boolean {
     return (
@@ -1606,13 +1703,18 @@ class TableWidget extends WidgetType {
       this.readOnly === other.readOnly &&
       this.layoutMode === other.layoutMode &&
       this.autoResize === other.autoResize &&
+      this.availableWidth === other.availableWidth &&
       this.table.from === other.table.from &&
       this.table.to === other.table.to &&
       this.table.source === other.table.source
     )
   }
   get estimatedHeight(): number {
-    return (this.table.rows.length + 1) * this.rowHeight + 2
+    // A measured height beats any estimate: it makes the second pass over the same
+    // table exact, so scrolling back never re-shapes the height map.
+    const measured = measuredTableHeights.get(this.heightKey)
+    if (measured !== undefined) return measured
+    return estimateTableHeight(this.table, this.availableWidth, this.rowHeight)
   }
 
   updateDOM(dom: HTMLElement): boolean {
@@ -1697,7 +1799,12 @@ class TableWidget extends WidgetType {
     if (typeof ResizeObserver !== 'undefined') {
       controller.resizeObserver = new ResizeObserver(() => {
         scheduleTableLayout(wrapper, controller)
-        view.requestMeasure()
+        const measured = wrapper.getBoundingClientRect().height
+        const known = measuredTableHeights.get(this.heightKey)
+        rememberTableHeight(this.heightKey, measured)
+        // 只在几何真的变了才请求重排：否则每次挂载都会白跑一轮 measure，
+        // 而 measure 本身又会改高度图。
+        if (known === undefined || Math.abs(measured - known) > 0.5) view.requestMeasure()
       })
       controller.resizeObserver.observe(wrapper)
     }
@@ -2124,6 +2231,7 @@ export function markdownTablePreview(options: MarkdownTablePreviewOptions = {}):
               this.view.state.readOnly,
               overrides.get(table.from) ?? columnWidthMode,
               autoResize,
+              this.view.contentDOM.clientWidth,
             ),
             block: true,
           }).range(table.from, table.to),

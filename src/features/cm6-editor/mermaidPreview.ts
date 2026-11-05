@@ -5,6 +5,7 @@ import { hiddenRangeSource, type HiddenRange } from './core/hiddenRanges'
 import type { PreviewRange } from './livePreview'
 import { viewportDecorationExtension } from './viewportDecorations'
 import { copySvgMarkupAsImage } from '../../lib/richClipboard'
+import { normalizeSvgViewport } from '../../lib/mermaidViewport'
 import { checkIcon, codeIcon, copyIcon } from './widgetIcons'
 import { isExternalDocumentSync } from './sync'
 
@@ -229,6 +230,7 @@ function applyRenderedMermaidSvg(
   content: HTMLElement,
   copy: HTMLButtonElement,
   svg: string,
+  view: EditorView,
 ): void {
   container.classList.remove('is-loading', 'is-error')
   appendSanitizedSvg(content, svg)
@@ -237,9 +239,35 @@ function applyRenderedMermaidSvg(
     svgElement.setAttribute('preserveAspectRatio', 'xMidYMid meet')
     svgElement.removeAttribute('height')
     svgElement.style.removeProperty('height')
+    // mermaid writes its own layout width into an inline `max-width`. Keeping it
+    // caps the diagram at the width it happened to be rendered at, so widening the
+    // window never enlarges the chart. CSS already supplies `width/max-width: 100%`
+    // plus a viewport-height cap; drop the inline value and let the stylesheet own it.
+    svgElement.style.removeProperty('max-width')
+    scheduleViewportNormalization(svgElement, view)
   }
   copy.disabled = false
   copy.title = '复制图片'
+}
+
+/**
+ * `getBBox()` only reports real geometry once the SVG is in the document, which is
+ * after `toDOM()` returns. Wait for that frame, then align viewBox to the measured
+ * content (see `lib/mermaidViewport.ts` for why mermaid's own viewBox is not enough).
+ * If CM6 has not attached the node yet, retry a few frames instead of giving up —
+ * the widget can be built while its parent is still detached.
+ */
+function scheduleViewportNormalization(svg: SVGSVGElement, view: EditorView): void {
+  let remaining = 5
+  const run = (): void => {
+    if (!svg.isConnected) {
+      remaining -= 1
+      if (remaining > 0) requestAnimationFrame(run)
+      return
+    }
+    if (normalizeSvgViewport(svg)) view.requestMeasure()
+  }
+  requestAnimationFrame(run)
 }
 
 export class MermaidWidget extends WidgetType {
@@ -357,7 +385,7 @@ export class MermaidWidget extends WidgetType {
     // path below swaps in the real content — the visible flash this whole
     // cache exists to avoid. Apply it synchronously here instead.
     const cachedSvg = this.cache.getResolvedSvg(this.block.source, this.version)
-    if (cachedSvg) applyRenderedMermaidSvg(container, content, copy, cachedSvg)
+    if (cachedSvg) applyRenderedMermaidSvg(container, content, copy, cachedSvg, view)
 
     const requestVersion = ++this.renderVersion
     void this.cache.render(this.block.source, this.version, this.renderer).then(
@@ -370,7 +398,7 @@ export class MermaidWidget extends WidgetType {
         // through that every single time. Only touch the DOM when the render
         // actually produced something the widget is not already showing.
         if (svg !== cachedSvg) {
-          applyRenderedMermaidSvg(container, content, copy, svg)
+          applyRenderedMermaidSvg(container, content, copy, svg, view)
           this.cache.rememberHeight(
             this.block.source,
             this.version,

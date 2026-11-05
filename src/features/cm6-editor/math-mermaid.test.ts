@@ -134,7 +134,22 @@ describe('CM6 Mermaid preview boundary', () => {
     expect(mermaidStyles).toMatch(
       /\.xmd-cm-mermaid-content svg\s*\{[^}]*height:\s*auto;[^}]*max-width:\s*100%;[^}]*width:\s*100%;/s,
     )
-    expect(mermaidStyles).not.toMatch(/\.xmd-cm-mermaid-content svg\s*\{[^}]*max-height:/s)
+    /*
+     * A viewport-relative ceiling is allowed: a diagram taller than the editor is
+     * scaled down as a whole (preserveAspectRatio="xMidYMid meet"), so the user can
+     * see the complete chart without scrolling. A fixed pixel height is still
+     * forbidden — that is what used to pin a large diagram to a box unrelated to its
+     * content and clip it from the inside.
+     *
+     * The ceiling must not reach the export renderer: long-image export rasterizes
+     * in chunks at the diagram's natural height, and a 68vh cap there drops content
+     * (see e2e/mermaid-export.spec.ts).
+     */
+    expect(mermaidStyles).not.toMatch(/\.xmd-cm-mermaid-content svg\s*\{[^}]*max-height:\s*\d+px;/s)
+    expect(mermaidStyles).toMatch(
+      /\.xmd-cm-editor:not\(\.xmd-export-renderer\) \.xmd-cm-mermaid-content svg\s*\{[^}]*max-height:\s*min\(/s,
+    )
+    expect(mermaidStyles).toMatch(/\.xmd-cm-mermaid-content svg\s*\{[^}]*overflow:\s*visible;/s)
   })
 
   it('keeps preview mounted while a non-empty selection crosses the block', () => {

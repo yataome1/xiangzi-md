@@ -79,6 +79,23 @@
   margin-inline: auto;
   max-width: 100%;
   width: 100%;
+  /*
+   * 兜底：万一根元素的 viewBox 仍比实际内容小（字体度量差异），内容也不会被
+   * SVG 自己的视口裁掉。
+   */
+  overflow: visible;
+}
+
+/*
+ * 只在交互编辑器里把高于一屏的图整体缩到可视范围内（preserveAspectRatio 已是
+ * xMidYMid meet，等比缩放不压扁）。
+ *
+ * 必须排除导出渲染：`.xmd-export-renderer` 用的是同一份样式，长图导出靠原始
+ * 高度做分块栅格化，一旦被压到 68vh，靠后的分块会取不到内容
+ * （e2e/mermaid-export.spec.ts 覆盖了这条）。
+ */
+.xmd-cm-editor:not(.xmd-export-renderer) .xmd-cm-mermaid-content svg {
+  max-height: min(68vh, 720px);
 }
 
 .xmd-cm-mermaid-content {

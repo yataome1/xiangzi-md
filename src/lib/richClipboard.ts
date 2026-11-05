@@ -7,6 +7,7 @@ import {
   getMermaidCopyMode,
 } from './copyPreferences'
 import { emitCopyFeedback } from './copyFeedback'
+import { normalizeSvgViewport } from './mermaidViewport'
 import { renderMermaidForExport } from './mermaidPreview'
 import { createTaskQueue } from './asyncPool'
 import { blobPartFromBytes, imageMimeType, xmdAssetPaths } from './asset'
@@ -728,9 +729,20 @@ export async function svgMarkupToPng(
   scale = 2,
 ): Promise<Blob | null> {
   const holder = document.createElement('div')
+  // getBBox 只有在元素参与布局时才返回真实几何。留在 detached 容器里测量会得到
+  // 0，导出图就会按 mermaid 那个偏小的 viewBox 栅格化、继续缺边；挂到屏幕外
+  // 既参与布局又不可见。
+  holder.style.cssText =
+    'position:fixed;left:-10000px;top:0;width:1000px;visibility:hidden;pointer-events:none'
   holder.innerHTML = svgMarkup
   const svg = holder.querySelector('svg')
   if (!svg) return null
+  document.body.append(holder)
+  try {
+    if (svg instanceof SVGSVGElement) normalizeSvgViewport(svg)
+  } catch {
+    // 测量失败时沿用 mermaid 自带的 viewBox，不阻断导出。
+  }
   const viewBox = svg.viewBox.baseVal
   const width = Math.max(1, Math.round(viewBox?.width || Number(svg.getAttribute('width')) || 800))
   const height = Math.max(
@@ -774,6 +786,7 @@ export async function svgMarkupToPng(
       canvas.height = 1
     }
     URL.revokeObjectURL(url)
+    holder.remove()
   }
 }
 
