@@ -1,0 +1,62 @@
+name: Build Windows Installer
+
+# 本地构建需要完整的 MSVC 工具链 + Windows SDK（安装需要管理员权限）。这条
+# workflow 用 GitHub 的 windows-latest 生成安装包，供没有本地工具链的机器下载。
+# 只产出可安装的 exe/msi：updater 产物需要签名私钥，这里显式关闭。
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/build-windows.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-installer:
+    name: Windows x64 installer
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: Build installer (updater signature disabled)
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' '{"bundle":{"createUpdaterArtifacts":false}}' > ci.bundle.conf.json
+          npx tauri build --config ci.bundle.conf.json
+
+      - name: Verify bundle output
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh src-tauri/target/release/bundle/nsis/ || true
+          test -n "$(find src-tauri/target/release/bundle/nsis -name '*.exe' -print -quit)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xiangzi-md-windows
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+          retention-days: 30
